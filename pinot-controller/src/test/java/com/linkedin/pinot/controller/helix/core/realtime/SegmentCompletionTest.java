@@ -113,7 +113,11 @@ public class SegmentCompletionTest {
     Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.HOLD);
     // s2 executes a succesful commit
     segmentCompletionMgr._secconds += 1;
-    response = segmentCompletionMgr.segmentCommit(segmentNameStr, s2, s2Offset);
+    response = segmentCompletionMgr.segmentCommitStart(segmentNameStr, s2, s2Offset);
+    Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.COMMIT_CONTINUE);
+
+    segmentCompletionMgr._secconds += 5;
+    response = segmentCompletionMgr.segmentCommitEnd(segmentNameStr, s2, s2Offset, true);
     Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.COMMIT_SUCCESS);
 
     // Now the FSM should have disappeared from the map
@@ -155,7 +159,10 @@ public class SegmentCompletionTest {
     Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.HOLD);
     // s2 commits.
     segmentCompletionMgr._secconds += 1;
-    response = segmentCompletionMgr.segmentCommit(segmentNameStr, s2, s2Offset);
+    response = segmentCompletionMgr.segmentCommitStart(segmentNameStr, s2, s2Offset);
+    Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.COMMIT_CONTINUE);
+    segmentCompletionMgr._secconds += 5;
+    response = segmentCompletionMgr.segmentCommitEnd(segmentNameStr, s2, s2Offset, true);
     Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.COMMIT_SUCCESS);
     // Now the FSM should have disappeared from the map
     Assert.assertFalse(fsmMap.containsKey(segmentNameStr));
@@ -266,8 +273,8 @@ public class SegmentCompletionTest {
     // s2 has no idea the controller failed, so it comes back with a commit,but the controller asks it to hold,
     // (essentially a commit failure)
     segmentCompletionMgr._secconds += 1;
-    response = segmentCompletionMgr.segmentCommit(segmentNameStr, s2, s2Offset);
-    Assert.assertFalse(response.getStatus().equals(SegmentCompletionProtocol.ControllerResponseStatus.COMMIT_SUCCESS));
+    response = segmentCompletionMgr.segmentCommitStart(segmentNameStr, s2, s2Offset);
+    Assert.assertTrue(response.getStatus().equals(SegmentCompletionProtocol.ControllerResponseStatus.HOLD));
 
     // So s2 goes back into HOLDING state. s1 and s3 are already holding, so now it will get COMMIT back.
     response = segmentCompletionMgr.segmentConsumed(segmentNameStr, s2, s2Offset);
@@ -282,7 +289,7 @@ public class SegmentCompletionTest {
     response = segmentCompletionMgr.segmentConsumed(segmentNameStr, s1, s1Offset);
     Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.NOT_LEADER);
 
-    response = segmentCompletionMgr.segmentCommit(segmentNameStr, s1, s1Offset);
+    response = segmentCompletionMgr.segmentCommitStart(segmentNameStr, s1, s1Offset);
     Assert.assertEquals(response.getStatus(), SegmentCompletionProtocol.ControllerResponseStatus.NOT_LEADER);
   }
 

@@ -112,6 +112,15 @@ public class SegmentCompletionManager {
     return fsm;
   }
 
+  /**
+   * This method is to be called when a server calls in with the segmentConsumed() API, reporting an offset in kafka
+   * that it currently has (i.e. next offset that it will consume, if it continues to consume).
+   *
+   * @param segmentNameStr Name of the LLC segment
+   * @param instanceId Instance that sent the segmentConsumed() request
+   * @param offset Kafka offset reported by the instance
+   * @return the protocol repsonse to be returned to the server.
+   */
   public SegmentCompletionProtocol.Response segmentConsumed(final String segmentNameStr, final String instanceId, final long offset) {
     if (!_helixManager.isLeader()) {
       return SegmentCompletionProtocol.RESP_NOT_LEADER;
@@ -126,19 +135,65 @@ public class SegmentCompletionManager {
     return response;
   }
 
-  public SegmentCompletionProtocol.Response segmentCommit(final String segmentNameStr, final String instanceId, final long offset) {
+  /**
+   * This method is to be called when a server calls in with the segmentCommit() API. The server sends in the segment
+   * along with the API, but it is the caller's responsibility to save the segment after this call (and before the
+   * segmentCommitEnd() call).
+   *
+   * If successful, this method will return Response.COMMIT_CONTINUE, in which case, the caller should save the incoming
+   * segment and then call segmentCommitEnd().
+   *
+   * Otherwise, this method will return a protocol response to be returned to the client right away (without saving the
+   * incoming segment).
+   *
+   * @param segmentNameStr  Name of the LLC segment
+   * @param instanceId  Instance that sent the segmentCommit() request
+   * @param offset  Kafka offset reported by the instance.
+   * @return
+   */
+  public SegmentCompletionProtocol.Response segmentCommitStart(final String segmentNameStr, final String instanceId, final long offset) {
     if (!_helixManager.isLeader()) {
       return SegmentCompletionProtocol.RESP_NOT_LEADER;
     }
     LLCSegmentName segmentName = new LLCSegmentName(segmentNameStr);
     SegmentCompletionFSM fsm = lookupOrCreateFsm(segmentName, SegmentCompletionProtocol.MSG_TYPE_CONSUMED, offset);
-    SegmentCompletionProtocol.Response response = fsm.segmentCommit(instanceId, offset);
+    SegmentCompletionProtocol.Response response = fsm.segmentCommitStart(instanceId, offset);
     if (fsm.isDone()) {
       LOGGER.info("Removing FSM (if present):{}", fsm.toString());
       _fsmMap.remove(segmentNameStr);
     }
     return response;
   }
+
+  /**
+   * This method is to be called when the segment sent in by the server has been saved locally in the correct path that
+   * is downloadable by the servers.
+   *
+   * It returns a response code to be sent back to the client.
+   *
+   * If the repsonse code is not COMMIT_SUCCESS, then the caller should remove the segnent that has been saved.
+   *
+   * @param segmentNameStr  Name of the LLC segment
+   * @param instanceId Instance that sent the segmentConsumed() request.
+   * @param offset Kafka offset reported by the client.
+   * @param success whether saving the segment was successful or not.
+   * @return
+   */
+  public SegmentCompletionProtocol.Response segmentCommitEnd(final String segmentNameStr, final String instanceId,
+      final long offset, boolean success) {
+    if (!_helixManager.isLeader()) {
+      return SegmentCompletionProtocol.RESP_NOT_LEADER;
+    }
+    LLCSegmentName segmentName = new LLCSegmentName(segmentNameStr);
+    SegmentCompletionFSM fsm = lookupOrCreateFsm(segmentName, SegmentCompletionProtocol.MSG_TYPE_CONSUMED, offset);
+    SegmentCompletionProtocol.Response response = fsm.segmentCommitEnd(instanceId, offset, success);
+    if (fsm.isDone()) {
+      LOGGER.info("Removing FSM (if present):{}", fsm.toString());
+      _fsmMap.remove(segmentNameStr);
+    }
+    return response;
+  }
+
 
   private static class SegmentCompletionFSM {
     // We will have some variation between hosts, so we add 10% to the max hold time to pick a winner.
@@ -439,80 +494,63 @@ public class SegmentCompletionManager {
       return response;
     }
 
-    /*
-     * A server is trying to commit a segment. Hopefully, this is the winner that we picked.
-     * We should be in the COMMITTER_NOTIFIED state at this point, anything else should be handled
-     * mostly with a HOLD return and perhaps aborting the FSM.
-     *
-     * We need to synchronize the processing of the message on the FSM, but then we can (must) release
-     * synchronization when the segment is being uploaded, and then re-acquire synchronization after
-     * the upload.
-     *
-     * Of course, we need a state-check after we re-acquire.
-     */
-    public SegmentCompletionProtocol.Response segmentCommit(String instanceId, long offset) {
+    public SegmentCompletionProtocol.Response segmentCommitStart(String instanceId, long offset) {
       long now = _segmentCompletionManager.getCurrentTimeMs();
-      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
-      switch (_state) {
-        case HOLDING:
-          return HOLDING__commit(instanceId, offset, now);
+      synchronized (this) {
+        LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
+        switch (_state) {
+          case HOLDING:
+            return HOLDING__commit(instanceId, offset, now);
 
-        case COMMITTER_DECIDED:
-          return COMMITTER_DECIDED__commit(instanceId, offset, now);
+          case COMMITTER_DECIDED:
+            return COMMITTER_DECIDED__commit(instanceId, offset, now);
 
-        case COMMITTER_NOTIFIED:
-          SegmentCompletionProtocol.Response response = null;
-          synchronized (this) {
-            response = checkBadCommitRequest(instanceId, offset, now);
-            if (response != null) {
-              return response;
-            }
-            LOGGER.info("{}:Uploading for instance={} offset={}", _state, instanceId, offset);
-            _state = State.COMMITTER_UPLOADING;
-          }
+          case COMMITTER_NOTIFIED:
+            return COMMITTER_NOTIFIED__commit(instanceId, offset, now);
 
-          // Accept commit. Need to release lock below while getting the segment.
-          boolean success = false;
-          try {
-            // TODO we need to keep a handle to the uploader so that we can stop it via the fsm.stop() call.
-            success = saveTheSegment();
-          } catch (Exception e) {
-            LOGGER.error("Segment upload failed");
-          }
-          if (!success) {
-            // Committer failed when posting the segment. Start over.
-            _state = State.ABORTED;
-            return SegmentCompletionProtocol.RESP_FAILED;
-          }
+          case COMMITTER_UPLOADING:
+            return COMMITTER_UPLOADING__commit(instanceId, offset, now);
 
-            /*
-             * Before we enter this code loop, it is possible that others threads have asked for this FSM, or perhaps
-             * we just took too long and this FSM has already been aborted or committed by someone else.
-             */
-          synchronized (this) {
-            response = updateZk(instanceId, offset);
-            if (response != null) {
-              return response;
-            }
-          }
-          return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.FAILED, -1L);
+          case COMMITTING:
+            return COMMITTING__commit(instanceId, offset, now);
 
-        case COMMITTER_UPLOADING:
-          return COMMITTER_UPLOADING__commit(instanceId, offset, now);
+          case COMMITTED:
+            return COMMITTED__commit(instanceId, offset);
 
-        case COMMITTING:
-          return COMMITTING__commit(instanceId, offset, now);
+          case ABORTED:
+            return hold(instanceId, offset);
 
-        case COMMITTED:
-          return COMMITTED__commit(instanceId, offset);
-
-        case ABORTED:
-          return hold(instanceId, offset);
-
-        default:
-          LOGGER.info("{}:FAILED for instance={} offset={}", _state, instanceId, offset);
-          return SegmentCompletionProtocol.RESP_FAILED;
+          default:
+            return fail(instanceId, offset);
+        }
       }
+    }
+
+    /*
+     * We can get this call only when the state is COMMITTER_UPLOADING. Also, the instanceId should be equal to
+     * the _winner.
+     */
+    public SegmentCompletionProtocol.Response segmentCommitEnd(String instanceId, long offset, boolean success) {
+      synchronized (this) {
+        LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
+        if (!_state.equals(State.COMMITTER_UPLOADING) || !instanceId.equals(_winner)) {
+          // State changed while we were out of sync. return a failed commit.
+          LOGGER.warn("State change during upload: state={} segment={} winner={} winningOffset={}",
+              _state, _segmentName.getSegmentName(), _winner, _winningOffset);
+          _state = State.ABORTED;
+          return SegmentCompletionProtocol.RESP_FAILED;
+        }
+        if (!success) {
+          LOGGER.error("Segment upload failed");
+          _state = State.ABORTED;
+          return SegmentCompletionProtocol.RESP_FAILED;
+        }
+        SegmentCompletionProtocol.Response response = updateZk(instanceId, offset);
+        if (response != null) {
+          return response;
+        }
+      }
+      return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.FAILED, -1L);
     }
 
     private SegmentCompletionProtocol.Response updateZk(String instanceId, long offset) {
@@ -534,26 +572,36 @@ public class SegmentCompletionManager {
       return null;
     }
 
-    private synchronized  SegmentCompletionProtocol.Response COMMITTED__commit(String instanceId, long offset) {
+    private SegmentCompletionProtocol.Response COMMITTED__commit(String instanceId, long offset) {
       if (offset == _winningOffset) {
         return keep(instanceId, offset);
       }
       return discard(instanceId, offset);
     }
 
-    private synchronized SegmentCompletionProtocol.Response COMMITTER_UPLOADING__commit(String instanceId, long offset,
+    private SegmentCompletionProtocol.Response COMMITTER_UPLOADING__commit(String instanceId, long offset,
         long now) {
-      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
       return processCommitWhileUploading(instanceId, offset, now);
     }
 
-    private synchronized  SegmentCompletionProtocol.Response COMMITTING__commit(String instanceId, long offset,
+    private SegmentCompletionProtocol.Response COMMITTING__commit(String instanceId, long offset,
         long now) {
-      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
       return processCommitWhileUploading(instanceId, offset, now);
+    }
+
+    private SegmentCompletionProtocol.Response COMMITTER_NOTIFIED__commit(String instanceId, long offset, long now) {
+      SegmentCompletionProtocol.Response response = null;
+      response = checkBadCommitRequest(instanceId, offset, now);
+      if (response != null) {
+        return response;
+      }
+      LOGGER.info("{}:Uploading for instance={} offset={}", _state, instanceId, offset);
+      _state = State.COMMITTER_UPLOADING;
+      return SegmentCompletionProtocol.RESP_COMMIT_CONTINUE;
     }
 
     private SegmentCompletionProtocol.Response processCommitWhileUploading(String instanceId, long offset, long now) {
+      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
       SegmentCompletionProtocol.Response response = abortIfTooLateAndReturnHold(now, instanceId, offset);
       if (response != null) {
         return response;
@@ -575,11 +623,11 @@ public class SegmentCompletionManager {
       return null;
     }
 
-    private synchronized SegmentCompletionProtocol.Response HOLDING__commit(String instanceId, long offset, long now) {
+    private SegmentCompletionProtocol.Response HOLDING__commit(String instanceId, long offset, long now) {
       return processCommitWhileHolding(instanceId, offset, now);
     }
 
-    private synchronized SegmentCompletionProtocol.Response COMMITTER_DECIDED__commit(String instanceId, long offset,
+    private SegmentCompletionProtocol.Response COMMITTER_DECIDED__commit(String instanceId, long offset,
         long now) {
       return processCommitWhileHolding(instanceId, offset, now);
     }

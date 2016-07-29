@@ -54,7 +54,7 @@ public class SegmentCompletionProtocol {
   public static final long MAX_SEGMENT_COMMIT_TIME_MS = 15000;
 
   public enum ControllerResponseStatus {
-    /** Never used by the controller, but locally used by server when sending a request fails */
+    /** Never sent by the controller, but locally used by server when sending a request fails */
     NOT_SENT,
 
     /** Server should send back a SegmentCommitRequest after processing this response */
@@ -80,6 +80,9 @@ public class SegmentCompletionProtocol {
 
     /** Commit succeeded, behave exactly like KEEP */
     COMMIT_SUCCESS,
+
+    /** Never sent by the controller, but locally used by the controller during the segmentCommit() processing */
+    COMMIT_CONTINUE,
   }
 
   public static final String STATUS_KEY = "status";
@@ -97,6 +100,7 @@ public class SegmentCompletionProtocol {
   public static final Response RESP_FAILED = new Response(ControllerResponseStatus.FAILED, -1L);
   public static final Response RESP_DISCARD = new Response(ControllerResponseStatus.DISCARD, -1L);
   public static final Response RESP_COMMIT_SUCCESS = new Response(ControllerResponseStatus.COMMIT_SUCCESS, -1L);
+  public static final Response RESP_COMMIT_CONTINUE = new Response(ControllerResponseStatus.COMMIT_CONTINUE, -1L);
 
   public static abstract class Request {
     final String _segmentName;
@@ -120,6 +124,12 @@ public class SegmentCompletionProtocol {
   }
 
   public static class SegmentConsumedRequest extends Request {
+    /**
+     *
+     * @param segmentName Name of the LLC segment
+     * @param offset Next offset from which the kafka client will consume, if it does.
+     * @param instanceId Name of the instance reporting this event.
+     */
     public SegmentConsumedRequest(String segmentName, long offset, String instanceId) {
       super(segmentName, offset, instanceId);
     }
@@ -130,6 +140,12 @@ public class SegmentCompletionProtocol {
   }
 
   public static class SegmentCommitRequest extends Request {
+    /**
+     *
+     * @param segmentName Name of the LLC segment
+     * @param offset Next offset from which the kafka client will consume, if it does.
+     * @param instanceId Name of the instance reporting this event.
+     */
     public SegmentCommitRequest(String segmentName, long offset, String instanceId) {
       super(segmentName, offset, instanceId);
     }
