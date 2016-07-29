@@ -211,7 +211,6 @@ public class SegmentCompletionManager {
       synchronized (this) {
         LOGGER.info("Processing segmentConsumed({}, {})", instanceId, offset);
         _commitStateMap.put(instanceId, offset);
-        SegmentCompletionProtocol.Response response = null;
         switch (_state) {
           // If we have waited "enough", or we have all replicas reported, then we should pick the winner.
           // Otherwise, we ask the server that is reporting to come back again later until one of these conditions hold.
@@ -223,9 +222,6 @@ public class SegmentCompletionManager {
           // Otherwise, just have the server HOLD. Since the segment is not committed yet, we cannot ask them to KEEP or
           // DISCARD etc. If the committer fails for any reason, this one may become the new committer!
           case COMMITTER_DECIDED: // This must be a retransmit
-            if (offset > _winningOffset) {
-              abortAndReturnHold(now, instanceId, offset);
-            }
             return COMMITTER_DECIDED__consumed(instanceId, offset, now);
 
           case COMMITTER_NOTIFIED:
@@ -242,15 +238,39 @@ public class SegmentCompletionManager {
 
           case ABORTED:
             // FSM has been aborted, just return HOLD
-            LOGGER.info("{}:ABORT for instance={} offset={}", _state, instanceId, offset);
-            response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.HOLD, offset);
-            return response;
+            return hold(instanceId, offset);
 
           default:
-            LOGGER.info("{}:FAILED for instance={} offset={}", _state, instanceId, offset);
-            return SegmentCompletionProtocol.RESP_FAILED;
+            return fail(instanceId, offset);
         }
       }
+    }
+
+    // Helper methods that log the current state and the response sent
+    private SegmentCompletionProtocol.Response fail(String instanceId, long offset) {
+      LOGGER.info("{}:FAIL for instance={} offset={}", _state, instanceId, offset);
+      return SegmentCompletionProtocol.RESP_FAILED;
+    }
+
+    private SegmentCompletionProtocol.Response commit(String instanceId, long offset) {
+      LOGGER.info("{}:COMMIT for instance={} offset={}", _state, instanceId, offset);
+      return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.COMMIT, offset);
+    }
+
+    private SegmentCompletionProtocol.Response discard(String instanceId, long offset) {
+      LOGGER.warn("{}:DISCARD for instance={} offset={}", _state, instanceId, offset);
+      return SegmentCompletionProtocol.RESP_DISCARD;
+    }
+
+    private SegmentCompletionProtocol.Response keep(String instanceId, long offset) {
+      LOGGER.info("{}:KEEP for instance={} offset={}", _state, instanceId, offset);
+      return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.KEEP, offset);
+    }
+
+    private SegmentCompletionProtocol.Response catchup(String instanceId, long offset) {
+      LOGGER.info("{}:CATCHUP for instance={} offset={}", _state, instanceId, offset);
+      return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.CATCH_UP,
+          _winningOffset);
     }
 
     private SegmentCompletionProtocol.Response hold(String instanceId, long offset) {
@@ -260,54 +280,49 @@ public class SegmentCompletionManager {
 
     private SegmentCompletionProtocol.Response abortAndReturnHold(long now, String instanceId, long offset) {
       _state = State.ABORTED;
-      LOGGER.warn("{}:Aborting FSM because it is too late instance={} offset={} now={} start={}", _state, instanceId,
-          offset, now, _startTime);
-      return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.HOLD, offset);
+      return hold(instanceId, offset);
     }
 
     private SegmentCompletionProtocol.Response abortIfTooLateAndReturnHold(long now, String instanceId, long offset) {
       if (now > _startTime + MAX_TIME_ALLOWED_TO_COMMIT_MS) {
+        LOGGER.warn("{}:Aborting FSM (too late) instance={} offset={} now={} start={}", _state, instanceId,
+            offset, now, _startTime);
         return abortAndReturnHold(now, instanceId, offset);
       }
       return null;
     }
+
     private SegmentCompletionProtocol.Response COMMITTED__consumed(String instanceId, long offset) {
       SegmentCompletionProtocol.Response
           response;// Server reporting an offset on an already completed segment. Depending on the offset, either KEEP or DISCARD.
       if (offset == _winningOffset) {
-        // Need to return KEEP
-        LOGGER.info("{}:KEEP for instance={} offset={}", _state, instanceId, offset);
-        response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.KEEP, offset);
+        response = keep(instanceId, offset);
       } else {
         // Return DISCARD. It is hard to say how long the server will take to complete things.
-        LOGGER.info("{}:DISCARD for instance={} offset={}", _state, instanceId, offset);
-        response = SegmentCompletionProtocol.RESP_DISCARD;
+        response = discard(instanceId, offset);
       }
       return response;
     }
 
     private SegmentCompletionProtocol.Response COMMITTER_NOTIFIED__consumed(String instanceId, long offset, long now) {
       SegmentCompletionProtocol.Response response;
-      // We have already picked a winner, and may or many not have heard from them.
+      // We have already picked a winner and notified them but we have not heard from them yet.
       // Common case here is that another server is coming back to us with its offset. We either respond back with HOLD or CATCHUP.
-      // It may be that we never heard from the committer, or the committer is taking too long to commit the segment.
-      // In that case, we abort the FSM and start afresh (i.e, return HOLD).
       // If the winner is coming back again, then we have some more conditions to look at.
       response = abortIfTooLateAndReturnHold(now, instanceId, offset);
       if (response != null) {
         return response;
       }
       if (instanceId.equals(_winner)) {
-        // Winner is coming back to with a HOLD. Perhaps the commit call failed in the winner for some reason
-        // Allow them to be winner again.
+        // Winner is coming back to after holding. Somehow they never hear us return COMMIT.
+        // Allow them to be winner again, since we are still within time to pick a winner.
         if (offset == _winningOffset) {
-          LOGGER.info("{}:Commit for instance={} offset={}", _state, instanceId, offset);
-          response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.COMMIT, offset);
+          response = commit(instanceId, offset);
         } else {
           // Something seriously wrong. Abort the transaction
+          response = discard(instanceId, offset);
+          LOGGER.warn("{}:Aborting for instance={} offset={}", _state, instanceId, offset);
           _state = State.ABORTED;
-          response = SegmentCompletionProtocol.RESP_DISCARD;
-          LOGGER.warn("{}:Abort for instance={} offset={}", _state, instanceId, offset);
         }
       } else {
         // Common case: A different instance is reporting.
@@ -315,9 +330,7 @@ public class SegmentCompletionManager {
           // Wait until winner has posted the segment before asking this server to KEEP the segment.
           response = hold(instanceId, offset);
         } else if (offset < _winningOffset) {
-          LOGGER.info("{}:CATCHUP for instance={} offset={}", _state, instanceId, offset);
-          response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.CATCH_UP,
-              _winningOffset);
+          response = catchup(instanceId, offset);
         } else {
           // We have not yet committed, so ask the new responder to hold. They may be the new leader in case the
           // committer fails.
@@ -328,15 +341,15 @@ public class SegmentCompletionManager {
     }
 
     private SegmentCompletionProtocol.Response COMMITTER_UPLOADING__consumed(String instanceId, long offset, long now) {
-      return common_consumed(instanceId, offset, now);
+      return processConsumedAfterCommitStart(instanceId, offset, now);
     }
 
     private SegmentCompletionProtocol.Response COMMITTING__consumed(String instanceId, long offset, long now) {
-      return common_consumed(instanceId, offset, now);
+      return processConsumedAfterCommitStart(instanceId, offset, now);
     }
 
     // A common method when the state is > COMMITTER_NOTIFIED.
-    private SegmentCompletionProtocol.Response common_consumed(String instanceId, long offset, long now) {
+    private SegmentCompletionProtocol.Response processConsumedAfterCommitStart(String instanceId, long offset, long now) {
       SegmentCompletionProtocol.Response response;
       // We have already picked a winner, and may or many not have heard from them.
       // Common case here is that another server is coming back to us with its offset. We either respond back with HOLD or CATCHUP.
@@ -361,9 +374,7 @@ public class SegmentCompletionManager {
           // Wait until winner has posted the segment before asking this server to KEEP the segment.
           response = hold(instanceId, offset);
         } else if (offset < _winningOffset) {
-          LOGGER.info("{}:CATCHUP for instance={} offset={}", _state, instanceId, offset);
-          response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.CATCH_UP,
-              _winningOffset);
+          response = catchup(instanceId, offset);
         } else {
           // We have not yet committed, so ask the new responder to hold. They may be the new leader in case the
           // committer fails.
@@ -374,27 +385,31 @@ public class SegmentCompletionManager {
     }
 
     private SegmentCompletionProtocol.Response COMMITTER_DECIDED__consumed(String instanceId, long offset, long now) {
+      if (offset > _winningOffset) {
+        LOGGER.warn("{}:Aborting FSM (offset larger than winning) instance={} offset={} now={} winning={}", _state, instanceId,
+            offset, now, _winningOffset);
+        return abortAndReturnHold(now, instanceId, offset);
+      }
       SegmentCompletionProtocol.Response response;
       if (_winner.equals(instanceId)) {
         if (_winningOffset == offset) {
-          LOGGER.info("{}:Committer notified winner instance={} offset={}", _state, instanceId, offset);
+          LOGGER.info("{}:Notifying winner instance={} offset={}", _state, instanceId, offset);
+          response = commit(instanceId, offset);
           _state = State.COMMITTER_NOTIFIED;
-          response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.COMMIT, offset);
         } else {
           // Winner coming back with a different offset.
-          LOGGER.warn("{}:Winner coming back with different offset for instance={} offset={} prevWinnOffset={}",
-              _state, instanceId, offset, _winningOffset);
+          LOGGER.warn("{}:Winner coming back with different offset for instance={} offset={} prevWinnOffset={}", _state,
+              instanceId, offset, _winningOffset);
           response = abortAndReturnHold(now, instanceId, offset);
         }
       } else  if (offset == _winningOffset) {
         // Wait until winner has posted the segment.
         response = hold(instanceId, offset);
       } else {
-        LOGGER.info("{}:Cathing up for instance={}  offset={}", _state, instanceId, _winningOffset);
-        response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.CATCH_UP, _winningOffset);
+        response = catchup(instanceId, offset);
       }
       if (now > _startTime + MAX_TIME_TO_NOTIFY_WINNER_MS) {
-        // Winner never got back to us. Abort the commit protocol and start afresh.
+        // Winner never got back to us. Abort the completion protocol and start afresh.
         // We can potentially optimize here to see if this instance has the highest so far, and re-elect them to
         // be winner, but for now, we will abort it and restart
         response = abortAndReturnHold(now, instanceId, offset);
@@ -404,21 +419,22 @@ public class SegmentCompletionManager {
 
     private SegmentCompletionProtocol.Response HOLDING__consumed(String instanceId, long offset, long now) {
       SegmentCompletionProtocol.Response response;
+      // If we are past the max time to pick a winner, or we have heard from all replicas,
+      // we are ready to pick a winner.
       if (now > _startTime + MAX_TIME_TO_PICK_WINNER_MS || _commitStateMap.size() == _numReplicas) {
         LOGGER.info("{}:Picking winner time={} size={}", _state, now-_startTime, _commitStateMap.size());
         pickWinner(instanceId);
         if (_winner.equals(instanceId)) {
           LOGGER.info("{}:Committer notified winner instance={} offset={}", _state, instanceId, offset);
+          response = commit(instanceId, offset);
           _state = State.COMMITTER_NOTIFIED;
-          response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.COMMIT, offset);
         } else {
           LOGGER.info("{}:Committer decided winner={} offset={}", _state, _winner, _winningOffset);
+          response = catchup(instanceId, offset);
           _state = State.COMMITTER_DECIDED;
-          response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.CATCH_UP, _winningOffset);
         }
       } else {
-        response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.HOLD, offset);
-        LOGGER.info("{}:Holding for instance={}  offset={}", _state, instanceId, offset);
+        response = hold(instanceId, offset);
       }
       return response;
     }
@@ -436,70 +452,74 @@ public class SegmentCompletionManager {
      */
     public SegmentCompletionProtocol.Response segmentCommit(String instanceId, long offset) {
       long now = _segmentCompletionManager.getCurrentTimeMs();
-      SegmentCompletionProtocol.Response response = null;
-      // Pre-process, prepare for uploading segment.
-        LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
-        switch (_state) {
-          case HOLDING:
-            return HOLDING__commit(instanceId, offset, now);
-          case COMMITTER_DECIDED:
-            return COMMITTER_DECIDED__commit(instanceId, offset, now);
-          case COMMITTER_NOTIFIED:
-            synchronized (this) {
-              response = checkBadCommitRequest(instanceId, offset, now);
-              if (response != null) {
-                return response;
-              }
-              LOGGER.info("{}:Uploading for instance={} offset={}", _state, instanceId, offset);
-              _state = State.COMMITTER_UPLOADING;
-            }
+      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
+      switch (_state) {
+        case HOLDING:
+          return HOLDING__commit(instanceId, offset, now);
 
-            // Accept commit. Need to release lock below while getting the segment.
-            boolean success = false;
-            try {
-              // TODO we need to keep a handle to the uploader so that we can stop it via the fsm.stop() call.
-              success = saveTheSegment();
-            } catch (Exception e) {
-              LOGGER.error("Segment upload failed");
+        case COMMITTER_DECIDED:
+          return COMMITTER_DECIDED__commit(instanceId, offset, now);
+
+        case COMMITTER_NOTIFIED:
+          SegmentCompletionProtocol.Response response = null;
+          synchronized (this) {
+            response = checkBadCommitRequest(instanceId, offset, now);
+            if (response != null) {
+              return response;
             }
-            if (!success) {
-              // Committer failed when posting the segment. Start over.
-              _state = State.ABORTED;
-              return SegmentCompletionProtocol.RESP_FAILED;
-            }
+            LOGGER.info("{}:Uploading for instance={} offset={}", _state, instanceId, offset);
+            _state = State.COMMITTER_UPLOADING;
+          }
+
+          // Accept commit. Need to release lock below while getting the segment.
+          boolean success = false;
+          try {
+            // TODO we need to keep a handle to the uploader so that we can stop it via the fsm.stop() call.
+            success = saveTheSegment();
+          } catch (Exception e) {
+            LOGGER.error("Segment upload failed");
+          }
+          if (!success) {
+            // Committer failed when posting the segment. Start over.
+            _state = State.ABORTED;
+            return SegmentCompletionProtocol.RESP_FAILED;
+          }
 
             /*
              * Before we enter this code loop, it is possible that others threads have asked for this FSM, or perhaps
              * we just took too long and this FSM has already been aborted or committed by someone else.
              */
-            synchronized (this) {
-              response = updateZk(instanceId, offset);
-              if (response != null) {
-                return response;
-              }
+          synchronized (this) {
+            response = updateZk(instanceId, offset);
+            if (response != null) {
+              return response;
             }
-            return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.FAILED, -1L);
+          }
+          return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.FAILED, -1L);
 
-          case COMMITTER_UPLOADING:
-            return COMMITTER_UPLOADING__commit(instanceId, offset, now);
-          case COMMITTING:
-            return COMMITTING__commit(instanceId, offset, now);
-          case COMMITTED:
-            return COMMITTED__commit(instanceId, offset);
-          case ABORTED:
-            LOGGER.info("{}:ABORT for instance={} offset={}", _state, instanceId, offset);
-            return new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.HOLD, offset);
-          default:
-            LOGGER.info("{}:FAILED for instance={} offset={}", _state, instanceId, offset);
-            return SegmentCompletionProtocol.RESP_FAILED;
-        }
+        case COMMITTER_UPLOADING:
+          return COMMITTER_UPLOADING__commit(instanceId, offset, now);
+
+        case COMMITTING:
+          return COMMITTING__commit(instanceId, offset, now);
+
+        case COMMITTED:
+          return COMMITTED__commit(instanceId, offset);
+
+        case ABORTED:
+          return hold(instanceId, offset);
+
+        default:
+          LOGGER.info("{}:FAILED for instance={} offset={}", _state, instanceId, offset);
+          return SegmentCompletionProtocol.RESP_FAILED;
+      }
     }
 
     private SegmentCompletionProtocol.Response updateZk(String instanceId, long offset) {
       boolean success;
       if (!_state.equals(State.COMMITTER_UPLOADING)) {
         // State changed while we were out of sync. return a failed commit.
-        LOGGER.warn("Segment done during upload: state={} segment={} winner={} winningOffset={}",
+        LOGGER.warn("State change during upload: state={} segment={} winner={} winningOffset={}",
             _state, _segmentName.getSegmentName(), _winner, _winningOffset);
         return SegmentCompletionProtocol.RESP_FAILED;
       }
@@ -515,30 +535,25 @@ public class SegmentCompletionManager {
     }
 
     private synchronized  SegmentCompletionProtocol.Response COMMITTED__commit(String instanceId, long offset) {
-      SegmentCompletionProtocol.Response response;
       if (offset == _winningOffset) {
-        LOGGER.info("{}:KEEP for instance={} offset={}", _state, instanceId, offset);
-        response = new SegmentCompletionProtocol.Response(SegmentCompletionProtocol.ControllerResponseStatus.KEEP, offset);
-      } else {
-        LOGGER.info("{}:DISCARD for instance={} offset={}", _state, instanceId, offset);
-        response = SegmentCompletionProtocol.RESP_DISCARD;
+        return keep(instanceId, offset);
       }
-      return response;
+      return discard(instanceId, offset);
     }
 
     private synchronized SegmentCompletionProtocol.Response COMMITTER_UPLOADING__commit(String instanceId, long offset,
         long now) {
       LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
-      return uploadingCommitting_commit(instanceId, offset, now);
+      return processCommitWhileUploading(instanceId, offset, now);
     }
 
     private synchronized  SegmentCompletionProtocol.Response COMMITTING__commit(String instanceId, long offset,
         long now) {
       LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
-      return uploadingCommitting_commit(instanceId, offset, now);
+      return processCommitWhileUploading(instanceId, offset, now);
     }
 
-    private SegmentCompletionProtocol.Response uploadingCommitting_commit(String instanceId, long offset, long now) {
+    private SegmentCompletionProtocol.Response processCommitWhileUploading(String instanceId, long offset, long now) {
       SegmentCompletionProtocol.Response response = abortIfTooLateAndReturnHold(now, instanceId, offset);
       if (response != null) {
         return response;
@@ -553,23 +568,24 @@ public class SegmentCompletionManager {
         return response;
       } else  if (instanceId.equals(_winner) && offset != _winningOffset) {
         // Hmm. Committer has been notified, but either a different one is committing, or offset is different
+        LOGGER.warn("{}:Aborting FSM (bad commit req) instance={} offset={} now={} winning={}", _state, instanceId,
+            offset, now, _winningOffset);
         return abortAndReturnHold(now, instanceId, offset);
       }
       return null;
     }
 
     private synchronized SegmentCompletionProtocol.Response HOLDING__commit(String instanceId, long offset, long now) {
-      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
-      return holdingDecided_commit(instanceId, offset, now);
+      return processCommitWhileHolding(instanceId, offset, now);
     }
 
     private synchronized SegmentCompletionProtocol.Response COMMITTER_DECIDED__commit(String instanceId, long offset,
         long now) {
-      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
-      return holdingDecided_commit(instanceId, offset, now);
+      return processCommitWhileHolding(instanceId, offset, now);
     }
 
-    private SegmentCompletionProtocol.Response holdingDecided_commit(String instanceId, long offset, long now) {
+    private SegmentCompletionProtocol.Response processCommitWhileHolding(String instanceId, long offset, long now) {
+      LOGGER.info("Processing segmentCommit({}, {})", instanceId, offset);
       SegmentCompletionProtocol.Response response = abortIfTooLateAndReturnHold(now, instanceId, offset);
       if (response != null) {
         return response;
